@@ -34,9 +34,9 @@ fn f32_bytes(v: &[f32]) -> Vec<u8> {
 
 fn meta(f: &grib2::Field, g: &wind::Grid) -> String {
     format!(
-        "{{\"ref_time\":{},\"lead_hours\":{},\"valid_time\":{},\"discipline\":{},\"category\":{},\"number\":{},\"source\":{{\"ni\":{},\"nj\":{},\"di\":{},\"dj\":{}}},\"west\":{},\"east\":{},\"south\":{},\"north\":{},\"nx\":{},\"ny\":{}}}",
+        "{{\"ref_time\":{},\"lead_hours\":{},\"valid_time\":{},\"discipline\":{},\"category\":{},\"number\":{},\"source\":{{\"ni\":{},\"nj\":{},\"grid\":\"{}\",\"uv_grid_relative\":{}}},\"west\":{},\"east\":{},\"south\":{},\"north\":{},\"nx\":{},\"ny\":{}}}",
         f.ref_time, f.lead_hours, f.ref_time + f.lead_hours * 3600.0, f.discipline, f.category, f.number,
-        f.ni, f.nj, f.di, f.dj, g.west, g.east, g.south, g.north, g.nx, g.ny
+        f.ni, f.nj, if f.lambert.is_some() { "lambert" } else { "latlon" }, f.uv_grid_relative, g.west, g.east, g.south, g.north, g.nx, g.ny
     )
 }
 
@@ -79,8 +79,7 @@ pub unsafe extern "C" fn ww_wind_grid(
         (Ok(mut a), Ok(mut b)) => (a.remove(0), b.remove(0)),
         (Err(e), _) | (_, Err(e)) => return error(e.to_string()),
     };
-    let gu = wind::regrid(&u, west, east, south, north, nx as usize, ny as usize);
-    let gv = wind::regrid(&v, west, east, south, north, nx as usize, ny as usize);
+    let (gu, gv) = wind::regrid_uv(&u, &v, west, east, south, north, nx as usize, ny as usize);
     blob([meta(&u, &gu).into_bytes(), f32_bytes(&gu.values), f32_bytes(&gv.values), vec![]])
 }
 
@@ -100,4 +99,22 @@ pub unsafe extern "C" fn ww_field_grid(ptr: *const u8, len: usize, west: f64, ea
         }
         Err(e) => error(e.to_string()),
     }
+}
+
+/// Earth-relative U/V at exact points. `pts` holds n (lat, lon) f64 pairs.
+/// Parts: JSON metadata, U (f32), V (f32).
+///
+/// # Safety
+/// The pointer/length pairs must be readable memory.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ww_wind_points(u_ptr: *const u8, u_len: usize, v_ptr: *const u8, v_len: usize, pts: *const f64, n: usize) -> *mut Blob {
+    let (ub, vb, p) = unsafe { (std::slice::from_raw_parts(u_ptr, u_len), std::slice::from_raw_parts(v_ptr, v_len), std::slice::from_raw_parts(pts, n * 2)) };
+    let (u, v) = match (grib2::decode_all(ub), grib2::decode_all(vb)) {
+        (Ok(mut a), Ok(mut b)) => (a.remove(0), b.remove(0)),
+        (Err(e), _) | (_, Err(e)) => return error(e.to_string()),
+    };
+    let points: Vec<(f64, f64)> = p.chunks(2).map(|c| (c[0], c[1])).collect();
+    let (us, vs) = wind::sample_points(&u, &v, &points);
+    let g = wind::Grid { west: 0.0, east: 0.0, south: 0.0, north: 0.0, nx: n, ny: 1, values: vec![] };
+    blob([meta(&u, &g).into_bytes(), f32_bytes(&us), f32_bytes(&vs), vec![]])
 }

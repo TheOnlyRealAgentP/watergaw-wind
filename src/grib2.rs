@@ -1,9 +1,11 @@
 //! GRIB2 decoding for NOAA model output.
 //!
 //! Supports what NOAA's operational models publish for surface wind and most
-//! other fields: regular latitude/longitude grids (template 3.0), and simple
-//! (5.0), complex (5.2), complex with spatial differencing (5.3) and PNG (5.41)
-//! packing, with or without a bitmap.
+//! other fields: regular latitude/longitude grids (template 3.0, e.g. GFS) and
+//! Lambert conformal grids (template 3.30, e.g. HRRR), with simple (5.0),
+//! complex (5.2), complex with spatial differencing (5.3) and PNG (5.41)
+//! packing, with or without a bitmap. Grid-relative wind components (flag 0x08)
+//! are reported so callers can rotate them to true north.
 
 use crate::Error;
 
@@ -26,8 +28,62 @@ pub struct Field {
     pub dj: f64,
     /// Rows run south to north when true (scanning-mode bit 0x40).
     pub south_first: bool,
+    /// Lambert conformal projection, when the grid isn't lat/lon.
+    pub lambert: Option<Lambert>,
+    /// U/V are relative to the grid's x/y axes rather than east/north.
+    pub uv_grid_relative: bool,
     /// Row-major values as stored (row 0 is the first scanned row). NaN = missing.
     pub values: Vec<f32>,
+}
+
+/// Lambert conformal conic projection on a sphere (GRIB2 template 3.30).
+#[derive(Debug, Clone)]
+pub struct Lambert {
+    /// Cone constant.
+    pub n: f64,
+    f: f64,
+    radius: f64,
+    lov: f64,
+    dx: f64,
+    dy: f64,
+    x1: f64,
+    y1: f64,
+}
+
+impl Lambert {
+    pub fn new(la1: f64, lo1: f64, lov: f64, latin1: f64, latin2: f64, dx: f64, dy: f64, radius: f64) -> Self {
+        let (p1, p2) = (latin1.to_radians(), latin2.to_radians());
+        let t = |p: f64| (std::f64::consts::FRAC_PI_4 + p / 2.0).tan();
+        let n = if (p1 - p2).abs() < 1e-9 { p1.sin() } else { (p1.cos() / p2.cos()).ln() / (t(p2) / t(p1)).ln() };
+        let f = p1.cos() * t(p1).powf(n) / n;
+        let mut l = Lambert { n, f, radius, lov, dx, dy, x1: 0.0, y1: 0.0 };
+        let (x1, y1) = l.xy(la1, lo1);
+        l.x1 = x1;
+        l.y1 = y1;
+        l
+    }
+
+    fn dlon(&self, lon: f64) -> f64 {
+        ((lon - self.lov + 540.0).rem_euclid(360.0) - 180.0).to_radians()
+    }
+
+    /// Projected metres (y grows northward).
+    fn xy(&self, lat: f64, lon: f64) -> (f64, f64) {
+        let rho = self.radius * self.f / (std::f64::consts::FRAC_PI_4 + lat.to_radians() / 2.0).tan().powf(self.n);
+        let th = self.n * self.dlon(lon);
+        (rho * th.sin(), -rho * th.cos())
+    }
+
+    /// Fractional grid indices (i east, j north from the first point).
+    pub fn index(&self, lat: f64, lon: f64) -> (f64, f64) {
+        let (x, y) = self.xy(lat, lon);
+        ((x - self.x1) / self.dx, (y - self.y1) / self.dy)
+    }
+
+    /// Angle (radians) from grid-north to true north at a longitude.
+    pub fn rotation(&self, lon: f64) -> f64 {
+        self.n * self.dlon(lon)
+    }
 }
 
 impl Field {
@@ -35,8 +91,41 @@ impl Field {
         if self.south_first { self.la1 + j as f64 * self.dj } else { self.la1 - j as f64 * self.dj }
     }
 
+    /// Fractional (i, j) of a point in storage order, if it falls inside the grid.
+    pub fn index_of(&self, lat: f64, lon: f64) -> Option<(f64, f64)> {
+        if let Some(l) = &self.lambert {
+            let (fi, mut fj) = l.index(lat, lon);
+            if !self.south_first {
+                fj = -fj;
+            }
+            // A hair of tolerance so points exactly on the edge survive rounding.
+            let (mi, mj) = ((self.ni - 1) as f64, (self.nj - 1) as f64);
+            let e = 1e-6;
+            return (fi >= -e && fj >= -e && fi <= mi + e && fj <= mj + e).then_some((fi.clamp(0.0, mi), fj.clamp(0.0, mj)));
+        }
+        None
+    }
+
+    /// Rotation (radians) to turn grid-relative U/V into east/north at a point.
+    pub fn uv_rotation(&self, lon: f64) -> f64 {
+        match (&self.lambert, self.uv_grid_relative) {
+            (Some(l), true) => l.rotation(lon),
+            _ => 0.0,
+        }
+    }
+
     /// Bilinear value at a point; handles global grids that wrap in longitude.
     pub fn sample(&self, lat: f64, lon: f64) -> f32 {
+        if self.lambert.is_some() {
+            let Some((fi, fj)) = self.index_of(lat, lon) else { return f32::NAN };
+            let (i0, j0) = (fi.floor() as usize, fj.floor() as usize);
+            let (i1, j1) = ((i0 + 1).min(self.ni - 1), (j0 + 1).min(self.nj - 1));
+            let (tx, ty) = ((fi - fi.floor()) as f32, (fj - fj.floor()) as f32);
+            let g = |i: usize, j: usize| self.values[j * self.ni + i];
+            let a = g(i0, j0) * (1.0 - tx) + g(i1, j0) * tx;
+            let b = g(i0, j1) * (1.0 - tx) + g(i1, j1) * tx;
+            return a * (1.0 - ty) + b * ty;
+        }
         let fj = if self.south_first { (lat - self.la1) / self.dj } else { (self.la1 - lat) / self.dj };
         if fj < 0.0 || fj > (self.nj - 1) as f64 {
             return f32::NAN;
@@ -165,7 +254,7 @@ pub fn decode_all(data: &[u8]) -> Result<Vec<Field>, Error> {
 fn decode_message(m: &[u8]) -> Result<Field, Error> {
     let mut f = Field {
         discipline: m[6], category: 0, number: 0, ref_time: 0.0, lead_hours: 0.0,
-        ni: 0, nj: 0, la1: 0.0, lo1: 0.0, di: 0.0, dj: 0.0, south_first: false, values: Vec::new(),
+        ni: 0, nj: 0, la1: 0.0, lo1: 0.0, di: 0.0, dj: 0.0, south_first: false, lambert: None, uv_grid_relative: false, values: Vec::new(),
     };
     let mut rep: Option<Rep> = None;
     let mut bitmap: Option<&[u8]> = None;
@@ -188,16 +277,42 @@ fn decode_message(m: &[u8]) -> Result<Field, Error> {
                 f.ref_time = (days_from_civil(y, s[14] as i64, s[15] as i64) * 86400 + s[16] as i64 * 3600 + s[17] as i64 * 60 + s[18] as i64) as f64;
             }
             3 => {
-                if be16(s, 12) != 0 {
-                    return Err(Error::Format("only regular lat/lon grids (template 3.0) are supported"));
+                // Earth shape: 6 = sphere of radius 6,371,229 m (NCEP), 0 = 6,367,470 m, 1 = given radius.
+                let radius = match s[14] {
+                    0 => 6_367_470.0,
+                    1 => be32(s, 16) as f64 / 10f64.powi(s[15] as i32),
+                    _ => 6_371_229.0,
+                };
+                let lon = |v: f64| if v > 180.0 { v - 360.0 } else { v };
+                match be16(s, 12) {
+                    0 => {
+                        f.ni = be32(s, 30) as usize;
+                        f.nj = be32(s, 34) as usize;
+                        f.la1 = sm32(be32(s, 46)) as f64 * 1e-6;
+                        f.lo1 = sm32(be32(s, 50)) as f64 * 1e-6;
+                        f.uv_grid_relative = s[54] & 0x08 != 0;
+                        f.di = be32(s, 63) as f64 * 1e-6;
+                        f.dj = be32(s, 67) as f64 * 1e-6;
+                        f.south_first = s[71] & 0x40 != 0;
+                    }
+                    30 => {
+                        f.ni = be32(s, 30) as usize;
+                        f.nj = be32(s, 34) as usize;
+                        f.la1 = sm32(be32(s, 38)) as f64 * 1e-6;
+                        f.lo1 = lon(sm32(be32(s, 42)) as f64 * 1e-6);
+                        f.uv_grid_relative = s[46] & 0x08 != 0;
+                        let lov = lon(sm32(be32(s, 51)) as f64 * 1e-6);
+                        let (dx, dy) = (be32(s, 55) as f64 * 1e-3, be32(s, 59) as f64 * 1e-3);
+                        f.south_first = s[64] & 0x40 != 0;
+                        let latin1 = sm32(be32(s, 65)) as f64 * 1e-6;
+                        let latin2 = sm32(be32(s, 69)) as f64 * 1e-6;
+                        if s[63] & 0x80 != 0 {
+                            return Err(Error::Format("south-pole Lambert grids aren't supported"));
+                        }
+                        f.lambert = Some(Lambert::new(f.la1, f.lo1, lov, latin1, latin2, dx, dy, radius));
+                    }
+                    _ => return Err(Error::Format("only lat/lon (3.0) and Lambert conformal (3.30) grids are supported")),
                 }
-                f.ni = be32(s, 30) as usize;
-                f.nj = be32(s, 34) as usize;
-                f.la1 = sm32(be32(s, 46)) as f64 * 1e-6;
-                f.lo1 = sm32(be32(s, 50)) as f64 * 1e-6;
-                f.di = be32(s, 63) as f64 * 1e-6;
-                f.dj = be32(s, 67) as f64 * 1e-6;
-                f.south_first = s[71] & 0x40 != 0;
             }
             4 => {
                 f.category = s[9];

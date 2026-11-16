@@ -27,6 +27,47 @@ pub fn regrid(f: &Field, west: f64, east: f64, south: f64, north: f64, nx: usize
     Grid { west, east, south, north, nx, ny, values }
 }
 
+/// U and V resampled together, rotated to true east/north when the source
+/// grid reports grid-relative components (e.g. HRRR's Lambert grid).
+pub fn regrid_uv(u: &Field, v: &Field, west: f64, east: f64, south: f64, north: f64, nx: usize, ny: usize) -> (Grid, Grid) {
+    let mut gu = Vec::with_capacity(nx * ny);
+    let mut gv = Vec::with_capacity(nx * ny);
+    for j in 0..ny {
+        let lat = north - (j as f64 + 0.5) / ny as f64 * (north - south);
+        for i in 0..nx {
+            let lon = west + (i as f64 + 0.5) / nx as f64 * (east - west);
+            let (ug, vg) = (u.sample(lat, lon), v.sample(lat, lon));
+            let a = u.uv_rotation(lon) as f32;
+            if a == 0.0 {
+                gu.push(ug);
+                gv.push(vg);
+            } else {
+                // NCEP/NCL rotation from grid-relative to earth-relative components.
+                let (s, c) = a.sin_cos();
+                gu.push(ug * c + vg * s);
+                gv.push(vg * c - ug * s);
+            }
+        }
+    }
+    let mk = |values| Grid { west, east, south, north, nx, ny, values };
+    (mk(gu), mk(gv))
+}
+
+/// Earth-relative U/V at exact points (lat, lon), rotating grid-relative winds.
+pub fn sample_points(u: &Field, v: &Field, points: &[(f64, f64)]) -> (Vec<f32>, Vec<f32>) {
+    points
+        .iter()
+        .map(|&(lat, lon)| {
+            let (ug, vg) = (u.sample(lat, lon), v.sample(lat, lon));
+            let a = u.uv_rotation(lon) as f32;
+            if a == 0.0 { (ug, vg) } else {
+                let (s, c) = a.sin_cos();
+                (ug * c + vg * s, vg * c - ug * s)
+            }
+        })
+        .unzip()
+}
+
 /// Speed (m/s) and the direction the wind blows FROM (degrees), meteorological convention.
 pub fn speed_dir(u: f32, v: f32) -> (f32, f32) {
     let s = (u * u + v * v).sqrt();

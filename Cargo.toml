@@ -1,6 +1,6 @@
 [package]
 name = "watergaw-wind"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 description = "Free wind fields from NOAA weather models: GRIB2 decoding and gridding in Rust, compiled to WebAssembly"
 license = "AGPL-3.0-or-later"
