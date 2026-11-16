@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Watergaw Wind</title>
+<meta name="description" content="Free, open wind data from NOAA's GFS model, decoded in your browser with Rust and WebAssembly.">
+<link rel="stylesheet" href="https://unpkg.com/maplibre-gl@5.24.0/dist/maplibre-gl.css">
+<script src="https://unpkg.com/maplibre-gl@5.24.0/dist/maplibre-gl.js"></script>
+<style>
+  :root { color-scheme: dark; --bg: #0b0e13; --text: #e9eef5; --muted: #9aa6b6; --line: rgba(255,255,255,0.1); }
+  html, body { margin: 0; height: 100%; background: var(--bg); color: var(--text); font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  #map { position: fixed; inset: 0; }
+  .card { position: fixed; left: 12px; top: 12px; max-width: min(360px, calc(100% - 24px)); background: rgba(14,18,25,0.9); border: 1px solid var(--line); border-radius: 14px; padding: 12px 14px; backdrop-filter: blur(12px); }
+  .card h1 { margin: 0 0 4px; font-size: 17px; }
+  .card p { margin: 4px 0; color: var(--muted); font-size: 13px; }
+  .card code { font-size: 12px; background: var(--line); padding: 1px 4px; border-radius: 4px; }
+  .card a { color: #64b5ff; }
+  #readout { color: var(--text) !important; font-weight: 600; }
+  .scale { display: flex; gap: 2px; margin-top: 8px; font-size: 11px; color: var(--muted); }
+  .scale span { flex: 1; text-align: center; }
+  .scale i { display: block; height: 6px; border-radius: 3px; margin-bottom: 2px; }
+</style>
+</head>
+<body>
+<div id="map"></div>
+<div class="card">
+  <h1>Watergaw Wind</h1>
+  <p>Live 10 m wind from NOAA's GFS model, downloaded straight from NOAA's open data on AWS and decoded in your browser (Rust → WebAssembly). No API key, no server.</p>
+  <p id="status">Loading the latest model run…</p>
+  <p id="readout">Tap the map for wind at that spot.</p>
+  <div class="scale" id="scale"></div>
+  <p><a href="https://github.com/TheOnlyRealAgentP/watergaw-wind">Source (AGPL-3.0)</a> · used by <a href="https://theonlyrealagentp.github.io/watergaw/">Watergaw</a></p>
+</div>
+<script type="module">
+import { WindEngine, speedDir } from './js/wind-engine.js';
+import { WindParticles, WIND_COLORS } from './js/wind-particles.js';
+
+const map = new maplibregl.Map({ container: 'map', style: 'https://tiles.openfreemap.org/styles/dark', center: [-96, 38], zoom: 3.4, renderWorldCopies: false });
+const engine = new WindEngine();
+let grid = null, anim = null;
+document.getElementById('scale').innerHTML = WIND_COLORS.map(([v, c]) => `<span><i style="background:${c}"></i>${Math.round(v * 2.237)}</span>`).join('') + '<span>mph</span>';
+
+async function refresh() {
+  const b = map.getBounds();
+  const box = { west: Math.max(-180, b.getWest() - 2), east: Math.min(180, b.getEast() + 2), south: Math.max(-85, b.getSouth() - 2), north: Math.min(85, b.getNorth() + 2) };
+  const nx = Math.min(240, Math.ceil((box.east - box.west) / 0.25)), ny = Math.min(180, Math.ceil((box.north - box.south) / 0.25));
+  grid = await engine.wind(box, { nx, ny });
+  document.getElementById('status').textContent = `${grid.source} · valid ${new Date(grid.validTime * 1000).toLocaleString()}`;
+  if (!anim) { anim = new WindParticles(map, (lat, lon) => grid.at(lat, lon)); }
+  anim.start();
+}
+map.on('load', refresh);
+let t;
+map.on('moveend', () => { clearTimeout(t); t = setTimeout(refresh, 600); });
+map.on('click', (e) => {
+  const w = grid?.at(e.lngLat.lat, e.lngLat.lng);
+  if (!w) return;
+  const [s, d] = speedDir(...w);
+  document.getElementById('readout').textContent = `${(s * 2.237).toFixed(0)} mph (${s.toFixed(1)} m/s) from ${Math.round(d)}°`;
+});
+</script>
+</body>
+</html>
