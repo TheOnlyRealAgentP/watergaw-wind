@@ -44,7 +44,8 @@ document.getElementById('scale').innerHTML = WIND_COLORS.map(([v, c]) => `<span>
 async function refresh() {
   const b = map.getBounds();
   const box = { west: Math.max(-180, b.getWest() - 2), east: Math.min(180, b.getEast() + 2), south: Math.max(-85, b.getSouth() - 2), north: Math.min(85, b.getNorth() + 2) };
-  const nx = Math.min(240, Math.ceil((box.east - box.west) / 0.25)), ny = Math.min(180, Math.ceil((box.north - box.south) / 0.25));
+  // ~3 km sampling (HRRR's spacing), capped for speed.
+  const nx = Math.max(32, Math.min(240, Math.round((box.east - box.west) / 0.03))), ny = Math.max(24, Math.min(180, Math.round((box.north - box.south) / 0.03)));
   grid = await engine.wind(box, { nx, ny });
   document.getElementById('status').textContent = `${grid.source} · valid ${new Date(grid.validTime * 1000).toLocaleString()}`;
   if (!anim) { anim = new WindParticles(map, (lat, lon) => grid.at(lat, lon)); }
